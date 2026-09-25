@@ -5,6 +5,10 @@ on:
     branches:
       - main
 
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
 jobs:
   build-and-deploy:
     name: Build → S3 → CloudFront
@@ -29,11 +33,10 @@ jobs:
           NEXT_PUBLIC_USE_MOCK_DATA: false
         run: npm run build
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Sync to S3
