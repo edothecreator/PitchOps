@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Next.js build output
+.next/
+out/
+
+# Environment variables — NEVER commit these
+.env
+.env.local
+.env.production
+.env.*.local
+
+# Misc
+.DS_Store
+*.pem
+*.log
+npm-debug.log*
+
+# Project notes — keep local only
+PROJECT_BREAKDOWN.txt
+LINKEDIN_POST.txt
+backend-deploy.yml
