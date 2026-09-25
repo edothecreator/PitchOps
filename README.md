@@ -1,233 +1,242 @@
 # PitchOps ⚽
 
-A production-grade football analytics dashboard — live standings, match results, player statistics and detailed match breakdowns for the top 5 European leagues, the UEFA Champions League and Europa League.
+A containerized football analytics platform deployed on AWS with a fully automated CI/CD pipeline.
 
 **Live at [pitchopsss.xyz](https://pitchopsss.xyz)**
 
-![PitchOps Dashboard](./screenshots/dashboard.png)
-
 ---
 
-## Features
-
-- **7 competitions** — Premier League, La Liga, Bundesliga, Serie A, Ligue 1, UCL, Europa League
-- **15 seasons** — browse any season from 2010 to 2024/25
-- **Full standings tables** — sortable by any column, qualification zone markers (UCL / UEL / UECL / Relegation)
-- **Match detail panel** — events timeline, possession/shots/xG stats, lineups, head-to-head history, match predictions
-- **Player leaderboards** — top scorers, assists, yellow cards with medal rankings
-- **Team analytics** — win rate, form guide, goal timing chart, formations breakdown
-- **Dark terminal aesthetic** — tabular numerals, shimmer skeletons, zero generic spinners
-
----
-
-## Architecture
+## Infrastructure Overview
 
 ```
-Browser (Static SPA)
-    │
-    ▼
-AWS CloudFront (CDN + HTTPS)
-    │
-    ├──► S3 Bucket (Next.js static export)
-    │
-    └──► api.pitchopsss.xyz
-              │
-              ▼
-         EC2 (eu-west-3)
-              ├── FastAPI container (port 8000)
-              └── PostgreSQL container (port 5432)
-                        │
-                        ▼
-                  API-Football v3
+┌─────────────────────────────────────────────────────────────┐
+│                        GitHub                               │
+│  Push to main → GitHub Actions (OIDC) → Build → Deploy     │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+          ┌────────────┴────────────┐
+          │                         │
+          ▼                         ▼
+   ┌─────────────┐         ┌─────────────────┐
+   │  S3 Bucket  │         │   EC2 Instance  │
+   │  (static)   │         │  (eu-west-3)    │
+   └──────┬──────┘         └───────┬─────────┘
+          │                        │
+          ▼                        │
+   ┌─────────────┐         ┌───────┴─────────┐
+   │ CloudFront  │         │     Nginx        │
+   │ + ACM SSL   │         │  (SSL termination│
+   │ + Custom    │         │   Let's Encrypt) │
+   │   Domain    │         └───────┬─────────┘
+   └─────────────┘                 │
+   pitchopsss.xyz          ┌───────┴─────────┐
+                           │  Docker Compose  │
+                           ├─────────────────┤
+                           │ FastAPI :8000    │
+                           │ PostgreSQL :5432 │
+                           └───────┬─────────┘
+                                   │
+                                   ▼
+                           API-Football v3
+                         (server-side, key never
+                          exposed to browser)
 ```
-
-The frontend **never calls API-Football directly**. The EC2 backend holds the API key server-side and proxies all requests. Swapping data providers is a one-file backend change.
 
 ---
 
-## Tech Stack
+## CI/CD Pipeline
 
-| Layer | Technology |
+### Frontend Pipeline — `.github/workflows/deploy.yml`
+
+Triggered on every push to `main`:
+
+```
+push to main
+    │
+    ├─► npm ci
+    ├─► npm run build  (Next.js static export → /out)
+    ├─► OIDC token exchange with AWS STS
+    ├─► aws s3 sync out/ → S3
+    └─► aws cloudfront create-invalidation → cache bust
+```
+
+**Authentication: OIDC (no static credentials)**
+
+Uses `aws-actions/configure-aws-credentials` with `role-to-assume` — GitHub requests a short-lived STS token at runtime. Zero long-lived credentials stored anywhere.
+
+Required GitHub secrets:
+
+| Secret | Purpose |
 |---|---|
-| Framework | Next.js 14, App Router, TypeScript |
-| Styling | Tailwind CSS v3 |
-| Data fetching | TanStack Query v5 |
-| Build output | Static export (`output: 'export'`) |
-| Backend | FastAPI (Python), Uvicorn |
-| Cache | In-memory TTL (24h historical, 1h standings) |
-| Database | PostgreSQL 16 |
-| Containers | Docker + Docker Compose |
-| CDN | AWS CloudFront |
-| Storage | AWS S3 |
-| Compute | AWS EC2 |
-| SSL (frontend) | AWS ACM |
-| SSL (backend) | Let's Encrypt + Certbot + Nginx |
-| Domain | Spaceship.com |
-| Data source | API-Football v3 |
+| `AWS_ROLE_ARN` | IAM role to assume via OIDC |
+| `S3_BUCKET` | Deployment target |
+| `CF_DISTRIBUTION_ID` | CloudFront invalidation target |
+| `NEXT_PUBLIC_API_BASE_URL` | Baked into static build |
+
+### Backend Pipeline — `.github/workflows/deploy.yml` (pitchops-backend repo)
+
+```
+push to main
+    │
+    ├─► docker build
+    ├─► trivy image scan (blocks on HIGH/CRITICAL CVEs)
+    ├─► SSH into EC2
+    ├─► git pull origin main
+    ├─► docker compose down
+    ├─► docker compose up -d --build
+    └─► docker system prune -f
+```
+
+Required GitHub secrets:
+
+| Secret | Purpose |
+|---|---|
+| `EC2_IP` | Target server |
+| `EC2_SSH_KEY` | EC2 private key (PEM contents) |
 
 ---
 
-## Pages
+## AWS Infrastructure
 
-### `/` — Overview Dashboard
-Recent results strip, standings snapshots for all 6 competitions, top scorers tickers.
+### IAM — OIDC Federation
 
-### `/standings` — Full Tables
-Sortable league tables with qualification zone markers. Switch between 7 leagues and seasons 2010–2024.
+Instead of long-lived IAM user access keys, the pipeline uses **OpenID Connect federation**:
 
-### `/matches` — Results + Detail
-Paginated results list. Click any match to open a 5-tab detail panel:
-- **Events** — goals, cards, substitutions with minute and player name
-- **Stats** — possession, shots, corners, pass accuracy, xG (side-by-side bars)
-- **Lineups** — starting XI, subs, formation and coach for both teams
-- **H2H** — all-time head-to-head record, win percentages, recent meetings
-- **Prediction** — win probability bar, attack/defense/form comparison
+1. GitHub's OIDC provider registered in AWS IAM
+2. IAM role with trust policy scoped to this exact repo
+3. GitHub Actions exchanges a short-lived JWT for temporary STS credentials
+4. Credentials expire after 15 minutes
 
-### `/statistics` — Analytics
-Top scorers, top assists, discipline leaderboards. Team stats: win rate, form guide (last 10), goal timing bar chart, preferred formations.
+Trust policy handles GitHub's new immutable-ID subject claim format (changed July 15, 2026):
 
----
-
-## Getting Started
-
-```bash
-# Install dependencies
-npm install
-
-# Run dev server (uses mock data by default)
-npm run dev
-
-# Production static export
-npm run build
-# → output in /out directory
+```json
+"StringLike": {
+  "token.actions.githubusercontent.com:sub": [
+    "repo:edothecreator/*",
+    "repo:edothecreator@159837701/*",
+    "repo:edothecreator@159837701/PitchOps@1386571582:*"
+  ]
+}
 ```
 
-### Environment Variables
+IAM role permissions — least privilege:
 
-```bash
-# .env.local
-
-# Your EC2 backend URL
-NEXT_PUBLIC_API_BASE_URL=https://api.pitchopsss.xyz
-
-# "true" = use local mock data (no backend needed for dev/demo)
-NEXT_PUBLIC_USE_MOCK_DATA=true
+```json
+{
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::BUCKET", "arn:aws:s3:::BUCKET/*"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "cloudfront:CreateInvalidation",
+      "Resource": "*"
+    }
+  ]
+}
 ```
 
-Set `NEXT_PUBLIC_USE_MOCK_DATA=true` to run the full UI without any backend. All hooks fall back to realistic local JSON in `src/data/mock/`.
+### S3
 
----
+- Static website hosting enabled
+- `index.html` as both index and error document (SPA routing)
+- Public access enabled for CloudFront origin
+- Synced via `aws s3 sync --delete` on every deploy
 
-## Project Structure
+### CloudFront
 
-```
-src/
-├── app/                    Pages (/, /standings, /matches, /statistics)
-├── components/
-│   ├── layout/             Sidebar, Header, MobileNav, AppShell
-│   ├── ui/                 Badge, Skeleton, Card, Tabs, ProgressBar, ...
-│   ├── dashboard/          RecentResultsStrip, StandingsSnapshot, TopScorersTicker
-│   ├── standings/          StandingsTable (sortable, zone markers)
-│   ├── matches/            FixtureCard, MatchEvents, MatchStats, MatchLineups,
-│   │                       H2HCard, PredictionCard, ResultsList
-│   └── statistics/         TopScorersTable, TeamStatsCard
-├── hooks/                  TanStack Query hooks for all data
-├── lib/
-│   ├── api/client.ts       Typed fetch functions (one per backend endpoint)
-│   ├── api/types.ts        Full TypeScript response types
-│   ├── utils.ts            cn(), date/status helpers
-│   └── constants.ts        League IDs, seasons list
-└── data/mock/              Local mock data (realistic La Liga + CL data)
-```
+- S3 origin with OAC (Origin Access Control)
+- Custom domain: `pitchopsss.xyz`
+- SSL: ACM certificate (us-east-1, required for CloudFront)
+- Error pages: 403/404 → `/index.html` (200) — critical for client-side routing
+- Cache invalidated on every deploy (`/*`)
 
----
+### EC2
 
-## Backend API Contract
+- Region: `eu-west-3` (Europe - Paris)
+- OS: Ubuntu 22.04 LTS
+- Security group inbound rules:
 
-The frontend calls these endpoints on the EC2 backend:
-
-```
-GET /standings?league={id}&season={year}
-GET /fixtures?league={id}&season={year}&from={date}&to={date}
-GET /fixtures/{id}/events
-GET /fixtures/{id}/statistics
-GET /fixtures/{id}/lineups
-GET /fixtures/{id}/h2h
-GET /fixtures/{id}/prediction
-GET /statistics/top-scorers?league={id}&season={year}
-GET /statistics/top-assists?league={id}&season={year}
-GET /statistics/top-yellowcards?league={id}&season={year}
-GET /statistics/team/{id}?league={id}&season={year}
-```
-
-All responses are normalized server-side before reaching the frontend.
-
----
-
-## Deployment
-
-### S3 + CloudFront (Frontend)
-
-```bash
-npm run build
-aws s3 sync out/ s3://your-bucket-name --delete
-aws cloudfront create-invalidation --distribution-id YOUR_ID --paths "/*"
-```
-
-**Critical CloudFront config** — add these Error Pages or hard refreshes on deep routes fail:
-
-| HTTP error | Response path | Response code |
+| Port | Protocol | Purpose |
 |---|---|---|
-| 403 | /index.html | 200 |
-| 404 | /index.html | 200 |
+| 22 | TCP | SSH admin access |
+| 80 | TCP | Let's Encrypt ACME challenge |
+| 443 | TCP | HTTPS production traffic |
+| 8000 | TCP | Direct container access (dev/testing) |
 
-### EC2 (Backend)
+### ACM (AWS Certificate Manager)
 
-```bash
-# On EC2
-git clone your-backend-repo
-cd pitchops-backend
-
-# Set environment variables in docker-compose.yml
-# FOOTBALL_API_KEY, FRONTEND_ORIGIN, DB credentials
-
-docker compose up -d
-```
-
-### HTTPS on EC2 (Nginx + Certbot)
-
-```bash
-sudo apt install -y nginx certbot python3-certbot-nginx
-sudo certbot --nginx -d api.yourdomain.com
-```
-
-Requires port 80 open in security group for ACME challenge.
+- Certificate covers `pitchopsss.xyz` and `www.pitchopsss.xyz`
+- Validated via DNS (CNAME records in Spaceship DNS)
+- Must be provisioned in `us-east-1` for CloudFront attachment
+- Auto-renews
 
 ---
 
-## Design System
+## EC2 — Container Architecture
 
-| Token | Value | Usage |
-|---|---|---|
-| `base` | `#0b0f19` | Page background |
-| `surface` | `#111827` | Cards, panels |
-| `accent` | `#22c55e` | Active nav, CTAs |
-| `accent-blue` | `#3b82f6` | UCL zone, secondary charts |
-| `zone-ucl` | `#3b82f6` | Champions League row marker |
-| `zone-uel` | `#f97316` | Europa League row marker |
-| `zone-uecl` | `#a78bfa` | Conference League row marker |
-| `zone-relegation` | `#ef4444` | Relegation row marker |
+Two containers managed by Docker Compose:
 
-Typography: Inter with `font-variant-numeric: tabular-nums` on all stats so digits align in columns.
+```yaml
+services:
+  backend:   # FastAPI on :8000
+  db:        # PostgreSQL 16 on :5432
+```
+
+**Nginx** runs on the host as a reverse proxy:
+- Listens on :443 (SSL terminated here)
+- Proxies to FastAPI container on localhost:8000
+- SSL certificate from Let's Encrypt via Certbot
+- HTTP → HTTPS redirect on :80
+
+**Why proxy through Nginx instead of exposing FastAPI directly?**
+- SSL termination at the edge
+- Easy certificate renewal (Certbot handles it automatically)
+- FastAPI never handles TLS — simpler, faster
 
 ---
 
-## API-Football Free Plan Notes
+## DNS — Spaceship.com
 
-- 100 requests/day — preserved by server-side TTL cache
-- No `?last=N` parameter — use `from/to` date ranges instead
-- Logo/image calls are free (don't count toward quota)
-- Historical seasons back to 2010 available
+Domain: `pitchopsss.xyz` ($1.86/year)
+
+| Record | Type | Value | Purpose |
+|---|---|---|---|
+| `@` | CNAME | `d6cymn76yf56.cloudfront.net` | Frontend |
+| `api` | A | `51.44.170.52` | Backend EC2 |
+| `_480eddf3...` | CNAME | `_4d1daae4...acm-validations.aws` | ACM validation |
+| `_ba9f510e...` | CNAME | `_bab59262...acm-validations.aws` | ACM validation |
+
+---
+
+## SSL/TLS
+
+**Frontend (CloudFront + ACM):**
+- Free AWS-managed certificate
+- Auto-renews
+- Covers apex domain + www
+
+**Backend (EC2 + Let's Encrypt):**
+```bash
+sudo certbot --nginx -d api.pitchopsss.xyz
+```
+- Free 90-day certificate, auto-renewed by Certbot systemd timer
+- Nginx config written automatically by Certbot
+
+---
+
+## Security Design
+
+| Concern | Solution |
+|---|---|
+| API key exposure | Key stored in Docker env var on EC2, never in frontend |
+| CI/CD credentials | OIDC federation — no static keys |
+| IAM least privilege | Role scoped to S3 bucket + one CloudFront distribution |
+| HTTPS everywhere | ACM on CDN, Let's Encrypt on API |
+| CORS | Backend allows only `pitchopsss.xyz` origins |
+| Container isolation | FastAPI never directly internet-accessible (Nginx in front) |
 
 ---
 
@@ -235,15 +244,48 @@ Typography: Inter with `font-variant-numeric: tabular-nums` on all stats so digi
 
 | Resource | Cost |
 |---|---|
-| Domain (pitchopsss.xyz) | $1.86/year |
 | EC2 t3.micro | ~$10/month |
-| S3 + CloudFront | ~$0.50/month |
-| ACM + Let's Encrypt | Free |
-| API-Football | Free |
+| S3 | ~$0.02/month |
+| CloudFront | Free tier |
+| ACM certificate | Free |
+| Let's Encrypt | Free |
+| Domain (Spaceship) | $1.86/year |
 | **Total** | **~$12/month** |
 
 ---
 
-## License
+## Local Development
 
-MIT
+```bash
+# Install deps
+npm install
+
+# Run with mock data (no backend needed)
+NEXT_PUBLIC_USE_MOCK_DATA=true npm run dev
+
+# Build static export
+npm run build
+# Output: /out — ready for S3
+```
+
+```bash
+# Test static build locally (mirrors CloudFront SPA behavior)
+npx serve -s out
+```
+
+---
+
+## Repository Structure
+
+```
+.github/
+└── workflows/
+    └── deploy.yml          # CI/CD: build → S3 → CloudFront invalidation
+
+src/
+├── app/                    # Next.js pages
+├── components/             # UI components
+├── hooks/                  # TanStack Query data hooks
+├── lib/api/                # Typed API client (one file to swap backend)
+└── data/mock/              # Mock data for dev/demo without backend
+```
